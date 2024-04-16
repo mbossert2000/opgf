@@ -1,0 +1,517 @@
+clear
+clc
+close all
+%% run parameters:
+run_name = "";
+rng(42) %for reproducibility
+%% base parameters
+%grid base parameter
+Ab = 100e6; %100 MW
+Vb = 20e3;
+Zb = Vb^2/Ab;
+
+%perfect gas properties
+gas = load("gas_properties_struct.mat").gas_properties_struct;
+%% Power grid data
+%Lines and bus tables
+lines = table2array(readtable("./data/lines_benchmark.csv"));
+n_lines = height(lines);
+table_buses = readtable("./data/buses_benchmark.csv");
+n_buses = height(table_buses);
+idx.slack = 1;
+idx.pq = 2:n_buses;
+idx.pv = [];
+idx.src = [1];
+
+%admittance matrix
+is_pu = true; %are lines parameters in ohms/farad or pu.
+[Y, YYL, YYT, Ib] = Ymatrix(lines, Ab, Vb, is_pu);
+
+%% Gas network data
+% Gas network tables
+table_nodes = readtable("./data/node_list.csv","ReadRowNames",true);
+table_pipes = readtable("./data/pipe_list.csv","ReadRowNames",true);
+
+%Gas incidence matrix
+[n_pipes,~] = size(table_pipes);
+[n_nodes,~] = size(table_nodes);
+idx.slack_gas = table_nodes{table_nodes.type == "slack","idx"};
+idx.demand = table_nodes{table_nodes.type == "demand","idx"};
+
+M = zeros(n_pipes,n_nodes);
+for p=1:n_pipes
+    from_idx = table_nodes{table_pipes{p,"From"},"idx"};
+    to_idx = table_nodes{table_pipes{p,"To"},"idx"};
+    M(p,from_idx) = 1;
+    M(p,to_idx) = -1;
+end
+M2 = M;
+M2(:,idx.slack_gas) = [];
+
+%pipe geometry
+L = table_pipes{:,"Leq"};
+D = table_pipes{:,"Diameter"}*1e-3;
+roughness = table_pipes{:,"Roughness"}*1e-3;
+A = pi.*D.^2./4;
+%friction factor curve
+[f_curve,Re_vec] = AGA_vec(D,roughness); %Friction factor
+%semilogx(Re_vec,f_curve(:,:)') %to plot the curve
+
+%% distributed generation data
+%% Distributed ressources
+%Electrical distributed generation:
+table_DG = readtable("./data/DG.csv");
+%photovoltaics
+% idx.PV = table_DG{table_DG.type == "photovoltaic","Node_grid"}; %node with solar PV installed
+% Pmax.PV = table_DG{table_DG.type == "photovoltaic","P_max"}*1e3/Ab; %installed power of PV converted in pu.
+% n_PV = length(idx.PV);
+% %wind turbine
+% idx.WT = table_DG{table_DG.type == "wind_turbine","Node_grid"};
+% Pmax.WT = table_DG{table_DG.type == "wind_turbine","P_max"}*1e3/Ab;
+% n_WT = length(idx.WT);
+% %Fuel cell
+% idx.FC_elec = table_DG{table_DG.type == "fuel_cell","Node_grid"};
+% Pmax.FC = table_DG{table_DG.type == "fuel_cell","P_max"}*1e3/Ab*0;
+% %feedin
+% idx.feed_in_elec = table_DG{table_DG.type == "feed_in","Node_grid"};
+% Pmax.feedin = table_DG{table_DG.type == "feed_in","P_max"}*1e3/Ab*0;
+% %Battery
+% idx.BAT = table_DG{table_DG.type == "battery","Node_grid"};
+% Pmax.BAT = table_DG{table_DG.type == "battery","P_max"}*1e3/Ab;
+% BAT_max = table_DG{table_DG.type == "battery","capacity"}*1e3/Ab;
+% efficiency.BAT = table_DG{table_DG.type == "battery","efficiency"};%assuming same chargin and dischargin efficiency
+% n_BAT = length(idx.BAT);
+
+
+%gas distributed ressources
+idx.feed_in = table_DG{table_DG.type == "feed_in","Node_gas"};
+n_feedin = length(idx.feed_in);
+feedin_max = table_DG{table_DG.type == "feed_in","P_max"}/1e3; %maximum feed-in power [MWth]
+efficiency_feedin = table_DG{table_DG.type == "feed_in","efficiency"};
+idx.FC_gas = table_DG{table_DG.type == "fuel_cell","Node_gas"}; %idx from gas network (different from power network)
+n_FC = length(idx.FC_gas);
+FC_max = [1; 1]; %temporary
+efficiency_FC = table_DG{table_DG.type == "fuel_cell","efficiency"};
+% idx.storage = table_DG{table_DG.type == "gas_storage","Node_gas"};
+% n_storage = length(idx.storage);
+% storage_max = table_DG{table_DG.type == "gas_storage","capacity"}/1e3;%in MWh_th
+% inj_storage_max = table_DG{table_DG.type == "gas_storage","P_max"}/1e3;%in MWh_th
+% efficiency.storage = table_DG{table_DG.type == "gas_storage","efficiency"};%assuming same chargin and dischargin efficiency
+
+%% runtime benchmark:
+t_vec = [];
+runtime_lin_vec = [];
+runtime_nonlin_vec = [];
+
+for nt = 1:24
+t_vec = [t_vec; nt];
+%% daily profiles:
+%profiles = readtable("./data/load_profile.csv");
+n_timesteps = nt;
+resolution = 1; %resolution of timestep
+profile.hours = [0:resolution:n_timesteps/resolution-resolution];
+
+%electrical load
+profile.load = table2array(readtable("./data/load_scenarios.csv")); %percentage of max value
+profile.loadgas = table2array(readtable("./data/gasload_scenarios.csv"));
+%profile.pv = table2array(readtable("./data/scenarios/pv_scenarios.csv")); %percentage of max value
+%profile.wind = table2array(readtable("./data/scenarios/wind_scenarios.csv")); %percentage of max value
+
+%profile.price_elec = table2array(readtable("./data/elpricenextday.csv"));
+%profile.price_gas = table2array(readtable("./data/gaspricenextday.csv"));
+profile.price_elec = ones(n_timesteps,1);
+profile.price_gas = ones(n_timesteps,1);
+
+P0 = zeros(n_buses*n_timesteps,1);
+Q0 = zeros(n_buses*n_timesteps,1);
+Qdot0 = zeros(n_nodes*n_timesteps,1);
+for t=1:n_timesteps
+    P0((t-1)*n_buses+1:t*n_buses,:) = -table_buses{:,"P_load"}.*profile.load(t).*resolution*1000/Ab;
+    Q0((t-1)*n_buses+1:t*n_buses,:) = -table_buses{:,"Q_load"}.*profile.load(t).*resolution*1000/Ab;
+    Qdot0((t-1)*n_nodes+1:t*n_nodes,:) = -table_nodes{:,"demand"}.*profile.loadgas(t).*resolution;
+end
+
+%pressure limits
+pmin = table_nodes{:,"pmin"};
+pmax = table_nodes{:,"pmax"};
+qmax = 50.*ones(n_pipes,1); %maximum flow in a pipe
+Qdotmax = 10*ones(n_nodes,1);
+Qdotmin = -10*ones(n_nodes,1);
+Qdotmin(idx.slack_gas) = 0;
+Qdotmax(idx.slack_gas) = 10000;
+
+%% Parameters
+S_star = P0 + j*Q0;
+E0 = ones(n_buses,1);
+I0 = zeros(n_buses,1);
+
+Parameters.tol = 1e-6;
+Parameters.n_max = 50;
+Parameters.step_size = 1;
+Parameters.max_jac = 1e10;
+Parameters.step_size = 0.4;
+Parameters.n_timesteps = n_timesteps;
+
+%% Linearized model
+tic
+%set-up linear model
+n_var = n_timesteps*(n_nodes + n_pipes + n_nodes + n_FC + n_feedin);
+% %structure of variables:
+% - p: n_nodes
+% - q: n_pipes
+% - Qdot: n_nodes
+% - Qdot_FC: n_FC %positive = draw from the gas network
+% - Qdot_feedin: n_feedin %positive = inject into gas network
+
+idxs.p = 1:n_nodes*n_timesteps;
+idxs.q = n_nodes*n_timesteps+1:n_timesteps*(n_nodes+n_pipes);
+idxs.Qdot = n_timesteps*(n_nodes+n_pipes)+1:n_timesteps*(2*n_nodes+n_pipes);
+idxs.Qdot_FC = n_timesteps*(2*n_nodes+n_pipes)+1:n_timesteps*(2*n_nodes+n_pipes+n_FC);
+idxs.Qdot_feedin = n_timesteps*(2*n_nodes+n_pipes+n_FC)+1:n_timesteps*(2*n_nodes+n_pipes+n_FC+n_feedin);
+idxs.slack_gas = 1:n_nodes:n_nodes*n_timesteps;
+idxs.demand = setdiff(idxs.p,idxs.slack_gas);
+id_noslack = eye(n_timesteps*n_nodes);
+id_noslack(idxs.slack_gas,:) = [];
+
+%fix matrices:
+%nodal load + DG (assuming for now DG is not on the slack)
+id_FC = zeros(n_timesteps*(n_nodes-1), n_timesteps*n_FC);
+for t=1:n_timesteps
+    for n=1:n_FC
+        idx_fc = idx.FC_gas(n);
+        id_FC(idx_fc+(t-1)*(n_nodes-1)-1,n+(t-1)*n_FC) = 1;
+    end
+end
+id_feedin = zeros(n_timesteps*(n_nodes-1), n_timesteps*n_feedin);
+for t=1:n_timesteps
+    for n=1:n_feedin
+        idx_feed = idx.feed_in(n);
+        id_feedin(idx_feed+(t-1)*(n_nodes-1)-1,n+(t-1)*n_feedin) = 1;
+    end
+end
+A_gas_load = [zeros(n_timesteps*(n_nodes-1),n_timesteps*(n_nodes+n_pipes)), id_noslack, -id_FC, id_feedin];
+b_gas_load = Qdot0(idxs.demand); 
+
+%conservation of energy on the whole network
+%FC and feedin injection are already taken into account in Qdot (cf. constraint above)
+%kron is equivalent to blkdiag(A,A,A,...,A) n_timesteps times
+A_slack_bal = [zeros(n_timesteps,n_timesteps*(n_nodes+n_pipes)), kron(eye(n_timesteps),ones(1,n_nodes)), zeros(n_timesteps, n_timesteps*(n_FC + n_feedin))]; 
+b_slack_bal = zeros(n_timesteps,1);
+
+
+%cost function
+f_cost = zeros(n_nodes*n_timesteps,1);
+f_cost(idxs.slack_gas) = 1;
+f_cost = [zeros(n_timesteps*(n_nodes + n_pipes),1);
+          f_cost;
+          zeros(n_timesteps*n_FC,1);
+          zeros(n_timesteps*n_feedin,1)];
+
+Aineq = [];
+bineq = [];
+lb = [repmat(pmin,n_timesteps,1); repmat(-qmax,n_timesteps,1); repmat(Qdotmin,n_timesteps,1); zeros(n_timesteps*n_FC,1); zeros(n_timesteps*n_feedin,1)];
+ub = [repmat(pmax,n_timesteps,1); repmat(qmax,n_timesteps,1); repmat(Qdotmax,n_timesteps,1); repmat(FC_max,n_timesteps,1); repmat(feedin_max,n_timesteps,1)];
+
+%initial states
+Qdot_star = Qdot0;
+Qdot_star(idxs.slack_gas) = [];
+p_slack = 0.7;
+p_rand = 0.6*ones(n_timesteps*n_nodes,1)+rand(n_timesteps*n_nodes,1)*0.1; %random start
+p_rand(idxs.slack_gas) = p_slack;
+pk = p_rand; %pressure at iteration k
+qk = zeros(n_timesteps*n_pipes,1); %pipe flow at iteration k, not used by linear model
+
+C = ones(n_timesteps*n_nodes,1);
+K_inj = zeros(n_timesteps*n_nodes,n_timesteps*(n_nodes-1)); %without slack
+K_inj_slack = zeros(n_timesteps*n_nodes,n_timesteps*n_nodes); %with slack
+
+Qdot_FC = zeros(n_timesteps*n_FC, 1);
+Qdot_feedin = zeros(n_timesteps*n_feedin, 1);
+
+
+%% iterative model
+
+for k=1:50
+    
+    %initial loadflow without DG
+    %[J,E,S,n_iter] = NR_polar(S_star,Y,E0,idx,Parameters);
+    for t=1:n_timesteps
+        idx_nodes_t = (t-1)*n_nodes+1:t*n_nodes;
+        [pt,qt,Ct] = NR_weymouth(M,Qdot_star((t-1)*(n_nodes-1)+1:t*(n_nodes-1)),pk(idx_nodes_t),L,D,gas,f_curve,Re_vec,Parameters,idx);
+        pk(idx_nodes_t) = pt;
+        C(idx_nodes_t) = Ct;
+
+        %compute sensitivity coeff
+        K_inj_t = pressure_coeff(M,Ct,pt);
+        K_inj((t-1)*n_nodes+1:t*n_nodes,(t-1)*(n_nodes-1)+1:t*(n_nodes-1)) = K_inj_t;
+        K_inj_slack((t-1)*n_nodes+1:t*n_nodes,(t-1)*(n_nodes)+2:t*(n_nodes)) = K_inj_t;
+    end
+    
+    %Pressure sensitivity coefficients:
+    %p - p0 = K*(Q-Q0) => p - K*Q = p0 - K*Q0
+    %K_inj has no column for the slack
+    A_p_sensitivity = [eye(n_timesteps*n_nodes), zeros(n_timesteps*n_nodes,n_timesteps*n_pipes), -K_inj_slack, zeros(n_timesteps*n_nodes, n_timesteps*(n_FC + n_feedin))];
+    b_p_sensitivity = pk - K_inj*Qdot_star;
+    
+    %Linear constraints:
+    Aeq = [A_p_sensitivity; A_gas_load; A_slack_bal];
+    beq = [b_p_sensitivity; b_gas_load; b_slack_bal];
+        
+    x = linprog(f_cost,Aineq,bineq,Aeq,beq,lb,ub);
+    
+    %recover solution:
+    pk_update = x(idxs.p);
+    Qdot_star = x(idxs.Qdot);
+    Qdot_star(idxs.slack_gas) = [];
+    Qdot_FC = x(idxs.Qdot_FC);
+    Qdot_feedin = x(idxs.Qdot_feedin);
+
+    %missmatch
+    delta_p = pk_update - pk;
+    if max(abs(delta_p)) <= 0.0001
+        for t=1:n_timesteps
+            idx_nodes_t = (t-1)*n_nodes+1:t*n_nodes;
+            [pt,qt,Ct] = NR_weymouth(M,Qdot_star((t-1)*(n_nodes-1)+1:t*(n_nodes-1)),pk(idx_nodes_t),L,D,gas,f_curve,Re_vec,Parameters,idx);
+            pk(idx_nodes_t) = pt;
+            qk((t-1)*n_pipes+1:t*n_pipes) = qt;
+            C(idx_nodes_t) = Ct;
+        end
+        break
+    end
+end
+
+runtime_lin = toc;
+runtime_lin
+runtime_lin_vec = [runtime_lin_vec; runtime_lin];
+%fprintf("conversion at iteration: %i", k)
+%store results
+p_lin = pk;
+q_lin = qk;
+C_lin = C;
+%Re_lin = max(abs(4*gas.rho_st/(pi*gas.mu)*(q_lin./D)*gas.MW_to_m3), 1e3*ones(n_pipes,1));
+%fr_lin = AGA(Re_vec,f_curve,Re_lin);
+
+
+%% Non-linear model
+tic
+n_var = n_timesteps*(n_nodes * 2 + n_pipes * 4);
+% %structure of variables:
+% - p: n_nodes*n_timesteps
+% - q: n_pipes*n_timesteps
+% - Qdot: n_nodes*n_timesteps
+% - Qdot_FC: n_FC*n_timesteps
+% - Qdot_feedin: n_feed_in*n_timesteps
+% - f : n_pipes*n_timesteps
+% - fr: n_pipes*n_timesteps
+% - C: n_pipes*n_timesteps
+idxs.f = n_timesteps*(2*n_nodes+n_pipes+n_FC+n_feedin)+1:n_timesteps*(2*n_nodes+2*n_pipes+n_FC+n_feedin);
+idxs.fr = n_timesteps*(2*n_nodes+2*n_pipes+n_FC+n_feedin)+1:n_timesteps*(2*n_nodes+3*n_pipes+n_FC+n_feedin);
+idxs.C = n_timesteps*(2*n_nodes+3*n_pipes+n_FC+n_feedin)+1:n_timesteps*(2*n_nodes+4*n_pipes+n_FC+n_feedin);
+
+%flow nodal balance
+A_q_bal = [zeros(n_timesteps*n_nodes,n_timesteps*n_nodes), kron(eye(n_timesteps),-M'), eye(n_timesteps*n_nodes), zeros(n_timesteps*n_nodes,n_timesteps*n_FC), zeros(n_timesteps*n_nodes,n_timesteps*n_feedin)];
+b_q_bal = zeros(n_timesteps*n_nodes,1);
+
+obj = @(x) f_cost'*x(1:idxs.Qdot_feedin(end)); %same linear cost as linear model
+%p0 = 0.6*ones(n_nodes*n_timesteps,1)+rand(n_nodes*n_timesteps,1)*0.1;
+%p0(idx.slack_gas) = p_slack;
+fr0 = 0.07*ones(n_timesteps*n_pipes,1);
+L_rep = repmat(L,n_timesteps,1);
+D_rep = repmat(D,n_timesteps,1);
+roughness_rep = repmat(roughness,n_timesteps,1);
+
+C0 = gas.m3_to_MW*13.2989.*(gas.T_st/gas.p_st).*(1./(L_rep.*gas.d_rel.*gas.T_avg.*gas.z_avg)).^0.5.*(1./fr0).^0.5.*D_rep.^(2.5)*1e5;
+x0 = [p_rand; %p
+      zeros(n_timesteps*n_nodes,1); %q
+      zeros(n_timesteps*n_nodes,1); %Qdot
+      zeros(n_timesteps*n_FC,1);
+      zeros(n_timesteps*n_feedin,1);
+      fr0;
+      fr0;
+      C0];
+
+%Linear constraints:
+Aeq_state = [A_q_bal; A_gas_load; A_slack_bal];
+[nline_Aeq, ~] = size(Aeq_state);
+Aeq = [Aeq_state, zeros(nline_Aeq, 3*n_pipes*n_timesteps)];
+beq = [b_q_bal; b_gas_load; b_slack_bal];
+Aineq = [];
+bineq = [];
+
+lb = [repmat(pmin,n_timesteps,1); repmat(-qmax,n_timesteps,1); repmat(Qdotmin,n_timesteps,1); zeros(n_timesteps*n_FC,1); zeros(n_timesteps*n_feedin,1); zeros(n_timesteps*n_pipes,1); zeros(n_timesteps*n_pipes,1); zeros(n_timesteps*n_pipes,1)];
+ub = [repmat(pmax,n_timesteps,1); repmat(qmax,n_timesteps,1); repmat(Qdotmax,n_timesteps,1); repmat(FC_max,n_timesteps,1); repmat(feedin_max,n_timesteps,1); fr0; fr0; 100*ones(n_timesteps*n_pipes,1)];
+
+options = optimoptions('fmincon','MaxFunctionEvaluations',1e5, 'MaxIterations',1e4, 'Algorithm','sqp');
+M_rep = kron(eye(n_timesteps),M);
+x = fmincon(obj,x0,Aineq,bineq,Aeq,beq,lb,ub,@(x)mycon(x,M_rep,D_rep,L_rep,roughness_rep,gas,idxs),options);
+
+runtime_nonlin = toc;
+runtime_nonlin_vec = [runtime_nonlin_vec; runtime_nonlin];
+% p_lin(1:n_nodes)
+% p_nonlin = x(idxs.p(1:n_nodes))
+% q_lin(1:n_pipes)
+% q_nonlin = x(idxs.q(1:n_pipes))
+% C_lin(1:n_pipes)
+% C_nonlin = x(idxs.C(1:n_pipes))
+
+% semilogx(Re_vec,f_curve(:,:)')
+% hold on
+% for n=1:length(Re_lin)
+%     plot(Re_lin(n),fr_lin(n),'x')
+% end
+% hold off
+% colororder(["red";"blue";"yellow";"black";"green"])
+end
+
+semilogy(t_vec, runtime_lin_vec)
+hold on
+semilogy(t_vec, runtime_nonlin_vec)
+%% functions
+function [c,ceq] = mycon(x, M, D, L, roughness, gas, idxs)
+    [n_pipes_ext, ~] = size(M);
+    p = x(idxs.p);
+    q = x(idxs.q);
+    f = x(idxs.f);
+    fr = x(idxs.fr);
+    C = x(idxs.C);
+    
+    % - f : n_pipes
+    % - fr: n_pipes
+    % - C: n_pipes 
+    
+    Re = max(abs(4.*gas.rho_st./(pi.*gas.mu).*(q./D).*gas.MW_to_m3), 1e3.*ones(n_pipes_ext,1));
+    c_f = (1./sqrt(f)) + 2*log10(2.825./(Re.*sqrt(f)));
+    c_fr = fr - max(f, (2*log10(roughness./(D.*3.7))).^-2);
+    
+    %Weymouth coefficients:
+    c_C = C - gas.m3_to_MW*13.2989.*(gas.T_st/gas.p_st).*(1./(L.*gas.d_rel.*gas.T_avg.*gas.z_avg)).^0.5.*(1./fr).^0.5.*D.^(2.5)*1e5;
+    %c_C = C - C_temp;
+    c_weymouth = q.*abs(q) - C.^2.*(M*p.^2);     % Compute nonlinear weymouth law.
+    
+    ceq = [c_f; c_fr; c_C; c_weymouth];
+    %ceq = [c_C; c_weymouth];
+    c = [];
+end
+% %% Problem based framework (didn't work)
+% %Create optimization variables
+% %power grid
+% P = optimvar("P",n_buses*n_timesteps); %Bus active power injection [pu.]
+% Q = optimvar("Q",n_buses*n_timesteps); %Bus reactive power injection [pu.]
+% P_slack = optimvar("P_slack",n_timesteps); %Active power drawn from the slack [pu.]
+% Q_slack = optimvar("Q_slack",n_timesteps); %Reactive power drawn from the slack [pu.]
+% P_losses = optimvar("P_losses",n_timesteps); %Active power losses in the grid [pu.]
+% Q_losses = optimvar("Q_losses",n_timesteps); %Reactive power losses in the grid [pu.]
+% I = optimvar("I",2.*n_lines*n_timesteps); %Line currents [pu.]
+% Vmag = optimvar("Vmag",n_buses*n_timesteps, "LowerBound", 0.95, "UpperBound", 1.05); %Bus voltages magnitude [pu.]
+% theta = optimvar("theta",n_buses*n_timesteps, "LowerBound", -pi/2, "UpperBound", pi/2);
+% 
+% %gas network
+% p = optimvar("p",n_nodes*n_timesteps,"LowerBound",pmin,"UpperBound",pmax); %Node pressures [bar]
+% q = optimvar("q",n_pipes*n_timesteps,"LowerBound",-qmax,"UpperBound",qmax); %Pipe flows [MWth]
+% z = optimvar("z",n_pipes*n_timesteps,'Type','integer','LowerBound',0,'UpperBound',1); %binary variable to represent flow direction
+% 
+% %Re = optimvar("Re",n_pipes*n_timesteps,"LowerBound",0);
+% %C = optimvar("C",n_pipes*n_timesteps,"LowerBound",0);
+% Qdot_slack = optimvar("Qdot_slack",n_timesteps,"LowerBound",0); %Gas injection from the external network [MWth]
+% Qdot = optimvar("Qdot",n_nodes*n_timesteps); %Net nodal gas flow injection [MWth]
+% 
+% %costs (objective function)
+% c_elec = optimvar("c_elec",n_timesteps);
+% c_gas = optimvar("c_gas",n_timesteps);
+% 
+% % Power network (flat start)
+% initialPoint.P = P0;
+% initialPoint.Q = Q0;
+% initialPoint.I = I0;
+% initialPoint.Vmag = abs(E0);
+% initialPoint.theta = zeros(n_nodes,1);
+% initialPoint.P_slack = 0;
+% initialPoint.Q_slack = 0;
+% %gas network
+% initialPoint.p = p0;
+% initialPoint.q = q0;
+% initialPoint.Qdot_slack = zeros(n_timesteps,1);
+% initialPoint.Qdot = Qdot0;
+% initialPoint.z = ones(n_nodes,1);
+% 
+% %costs
+% initialPoint.c_elec = zeros(n_timesteps,1);
+% initialPoint.c_gas = zeros(n_timesteps,1);
+% 
+% % Create problem
+% problem = optimproblem('ObjectiveSense','min');
+% 
+% % Define problem objective
+% %problem.Objective = sum(c_elec,'all'); %+ sum(c_gas,'all');
+% problem.Objective = sum(c_gas,'all');
+% 
+% % Define problem constraints
+% %costs
+% %problem.Constraints.c_elec_constr = c_elec == P_slack;
+% problem.Constraints.c_gas_constr = c_gas == Qdot_slack;
+% 
+% %Nonlinear gas model
+% % Define the positive sign constraint
+% problem.Constraints.weymouth_binary = q.^2 == C.^2 .* (2.*z - 1) .* (M*p.^2);
+% problem.Constraints.weymouth_1 = qmax .* (1 - z) <= q;
+% problem.Constraints.weymouth_2 = q <= z .* qmax;
+% M_pos = M;
+% M_neg = M;
+% M_pos(M_pos == -1) = 0;
+% M_neg(M_neg == 1) = 0;
+% problem.Constraints.weymouth_3 = M*p <= z .* (M_pos*pmax - M_neg*pmin);
+% problem.Constraints.weymouth_4 = M*p >= (1-z) .* (M_pos*pmin - M_neg*pmax);
+% 
+% 
+% 
+% %problem.Constraints.sgn = sgn == fcn2optimexpr(@(x) sign(M*x), p);
+% %problem.Constraints.sgn_constraint_pos = sgn(M*p >= 0) == 1;
+% %problem.Constraints.sgn_constraint_neg = sgn(M*p < 0) == -1;
+% 
+% %problem.Constraints.coeff_weymouth = C == gas.m3_to_MW*13.2989.*(gas.T_st/gas.p_st).*(1./(L.*gas.d_rel.*gas.T_avg.*gas.z_avg)).^0.5.*(1./fr).^0.5.*D.^(2.5)*1e5;
+% %problem.Constraints.weymouth = q == sgn.*C.*(sgn.*(M*p.^2)).^(1/2);
+% 
+% 
+% %Nodal gas flow balance
+% problem.Constraints.q_bal = Qdot(2:end) == M(:,2:end)'*q;
+% problem.Constraints.overall_bal = Qdot_slack == -sum(Qdot(2:end));
+% problem.Constraints.Qdot_slack = Qdot_slack == Qdot(idx.slack_gas);
+% 
+% 
+% % %Grid power
+% % %bus balance
+% % problem.Constraints.Pbal = P(idx.pq) == P_load;
+% % problem.Constraints.Qbal = Q(idx.pq) == Q_load;
+% % %nodal flow
+% % P_flow = optimconstr(n_buses);
+% % Q_flow = optimconstr(n_buses);
+% % for k=1:n_buses
+% %     Pk_star = 0;
+% %     Qk_star = 0;
+% %     for l=1:n_buses
+% %         Pk_star = Pk_star + Vmag(k)*Vmag(l)*(G(k,l)*cos(theta(k)-theta(l)) + B(k,l)*sin(theta(k)-theta(l)));
+% %         Qk_star = Qk_star + Vmag(k)*Vmag(l)*(G(k,l)*sin(theta(k)-theta(l)) - B(k,l)*cos(theta(k)-theta(l)));
+% %     end
+% %     P_flow(k) = P(k) == Pk_star;
+% %     Q_flow(k) = Q(k) == Qk_star;
+% % end
+% % problem.Constraints.Pflow = P_flow;
+% % problem.Constraints.Qflow = Q_flow;
+% 
+% % %P slack
+% % problem.Constraints.Pslack = P_slack == P(idx.slack);
+% % problem.Constraints.Qslack = Q_slack == Q(idx.slack);
+% % %Vmag & Theta slack
+% % problem.Constraints.Vslack = Vmag(idx.slack) == 1;
+% % problem.Constraints.Thetaslack = theta(idx.slack) == 0;
+% 
+% % Set nondefault solver options
+% % [autosolver,validsolvers] = solvers(problem);
+% 
+% %options = optimoptions("fmincon", "Display","none");
+% % Solve problem
+% %tic
+% %gs = GlobalSearch;
+% %problem_struc = prob2struct(problem);
+% %[solution, tot_cost] = run(gs, problem_struc);
+% %n  toc

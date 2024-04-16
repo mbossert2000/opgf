@@ -1,0 +1,4 @@
+﻿Node_grid,Node_gas,type,P_max,efficiency,capacity
+2,2,fuel_cell,2000,0.6,
+9,5,fuel_cell,1000,0.5,
+2,2,feed_in,1500,0.7,

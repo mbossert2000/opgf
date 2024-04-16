@@ -1,0 +1,4 @@
+﻿Bus_id,Bus_type,P_load,Q_load
+1,slack,0,0
+2,connection,0,0
+3,load,100,0
